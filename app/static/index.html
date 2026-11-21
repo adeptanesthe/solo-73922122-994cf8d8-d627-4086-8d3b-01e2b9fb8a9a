@@ -48,6 +48,16 @@
   .legend span { display:inline-block; margin-right:14px; }
   .sw { display:inline-block; width:14px; height:3px; vertical-align:middle; margin-right:4px; }
   code { background:#eff1f3; padding:1px 5px; border-radius:4px; font-size:12px; }
+  .warn { margin-top:14px; padding:12px 14px; border:1px solid #d4a72c; background:#fff8c5;
+          color:#7d4e00; border-radius:6px; font-size:13px; }
+  .ok { margin-top:10px; padding:10px 12px; border:1px solid #aceebb; background:#dafbe1;
+        color:#1a7f37; border-radius:6px; font-size:13px; }
+  .tiny { font-size:12px; color:var(--gray); }
+  .nowrap { white-space:nowrap; }
+  .alarm-yes { color:var(--red); font-weight:600; }
+  .alarm-no { color:var(--green); font-weight:600; }
+  .inline { display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; }
+  .inline > div { flex:1 1 180px; }
 </style>
 </head>
 <body>
@@ -129,6 +139,61 @@
       </tr></thead>
       <tbody id="cand-tbody"></tbody>
     </table>
+  </section>
+
+  <section class="card" id="drill-card">
+    <h2>4. 超温报警演练</h2>
+    <p class="tiny" style="margin-top:-6px">
+      沿用上方「输入数据」中的实测读数与「模型参数」中的观测噪声、核参数。从高斯过程后验
+      独立抽出 3 条炉温轨迹；每条轨迹以实测读数和该轨迹已有取值为条件，在新增时刻上
+      <b>联合</b>抽样（不是逐点拼接）。观测噪声只作用于实测读数；零噪声时已测时刻的模拟值
+      固定为实测温度。累计最多 200 个不同时刻。
+    </p>
+    <div class="grid">
+      <div><label for="alarm-temperature">报警温度（℃）</label>
+        <input type="number" id="alarm-temperature" step="any" value="700"></div>
+      <div><label for="drill-times">演练时刻（逗号 / 空格 / 换行分隔，可含已测时刻）</label>
+        <input type="text" id="drill-times" value="0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 9, 10.5, 11.5, 12.5, 14, 15.5"></div>
+      <div><label for="drill-seed">随机种子（同种子同输入可复现）</label>
+        <input type="number" id="drill-seed" step="1" min="0" value="20261121"></div>
+    </div>
+    <div class="actions">
+      <button id="drill-start" class="primary" type="button">开始演练（抽 3 条轨迹）</button>
+      <button id="drill-demo" type="button">演练用示例数据</button>
+    </div>
+
+    <div class="inline" style="margin-top:16px">
+      <div><label for="drill-new-times">插入新时刻（逗号分隔，一次可多个）</label>
+        <input type="text" id="drill-new-times" placeholder="例如 6.2, 12.8"></div>
+      <div style="flex:0 0 auto"><button id="drill-add" type="button">插入时刻并更新标记</button></div>
+      <div style="flex:0 0 auto"><button id="drill-recheck" type="button">只按新报警温度更新标记</button></div>
+    </div>
+    <div id="drill-error" class="error" hidden></div>
+    <div id="drill-note" class="ok" hidden></div>
+    <div id="drill-warn" class="warn" hidden></div>
+
+    <div id="drill-result" hidden>
+      <div class="summary" id="drill-summary" style="margin-top:14px"></div>
+
+      <h3>3 条条件抽样轨迹与首次超温点</h3>
+      <svg id="drill-chart" viewBox="0 0 720 300" role="img"></svg>
+      <div class="legend">
+        <span><span class="sw" style="background:#1f6feb"></span>轨迹 1</span>
+        <span><span class="sw" style="background:#8250df"></span>轨迹 2</span>
+        <span><span class="sw" style="background:#bf8700"></span>轨迹 3</span>
+        <span><span class="sw" style="background:#cf222e"></span>报警温度</span>
+        <span><span class="sw" style="background:#cf222e"></span>首次超温点（空心圈）</span>
+      </div>
+
+      <h3>标记明细</h3>
+      <table>
+        <thead><tr>
+          <th class="l">轨迹</th><th>模拟时刻数</th><th>首次超温时刻</th>
+          <th>该点模拟温度</th><th class="l">说明</th>
+        </tr></thead>
+        <tbody id="drill-tbody"></tbody>
+      </table>
+    </div>
   </section>
 </main>
 
@@ -276,7 +341,6 @@ $("run").addEventListener("click", async () => {
 });
 
 /* ---------- 结果渲染 ---------- */
-
 function render(payload, res) {
   $("result-card").hidden = false;
   const pct = res.total_variance_before > 0
@@ -335,6 +399,299 @@ function render(payload, res) {
   $("result-card").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
+/* ---------- 超温报警演练 ---------- */
+
+const TRAJ_COLORS = ["#1f6feb", "#8250df", "#bf8700"];
+const DRILL_LIMIT = 200;
+
+const drill = {
+  active: false,
+  base: null,        // {measured_times, measured_values, length_scale, noise_std, signal_variance}
+  trajectories: [],
+  alarm: null,
+  seed: 1,
+  step: 0,
+  nDistinct: 0,
+  adjusted: false,
+};
+
+function drillError(msg) {
+  const el = $("drill-error");
+  el.textContent = msg;
+  el.hidden = false;
+  $("drill-note").hidden = true;
+}
+function drillNote(msg) {
+  const el = $("drill-note");
+  el.textContent = msg;
+  el.hidden = false;
+  $("drill-error").hidden = true;
+}
+function clearDrillMessages() {
+  $("drill-error").hidden = true;
+  $("drill-note").hidden = true;
+  $("drill-warn").hidden = true;
+}
+
+function currentModelInputs() {
+  const measured_times = parseNumList($("measured-times").value, "已测时刻");
+  const measured_values = parseNumList($("measured-values").value, "已测温度");
+  if (measured_times.length !== measured_values.length)
+    throw new Error(`已测时刻（${measured_times.length} 个）与已测温度（${measured_values.length} 个）数量不一致`);
+  const num = id => {
+    const v = Number($(id).value);
+    if (!Number.isFinite(v)) throw new Error(`参数「${$(id).previousElementSibling?.textContent || id}」不是有限数值`);
+    return v;
+  };
+  const length_scale = num("length-scale");
+  const noise_std = num("noise-std");
+  const signal_variance = num("signal-variance");
+  if (length_scale <= 0) throw new Error("核长度尺度必须 > 0");
+  if (noise_std < 0) throw new Error("观测噪声必须 ≥ 0");
+  if (signal_variance <= 0) throw new Error("核信号方差必须 > 0");
+  return { measured_times, measured_values, length_scale, noise_std, signal_variance };
+}
+
+function alarmValue() {
+  const v = Number($("alarm-temperature").value);
+  if (!Number.isFinite(v)) throw new Error("报警温度必须是有限数值");
+  return v;
+}
+function seedValue() {
+  const v = Number($("drill-seed").value);
+  if (!Number.isInteger(v) || v < 0) throw new Error("随机种子必须是非负整数");
+  return v;
+}
+function newTimesValue() {
+  const vals = parseNumList($("drill-new-times").value, "插入时刻");
+  if (!vals.length) throw new Error("请填写要插入的新时刻");
+  return vals;
+}
+
+/* 实测读数、观测噪声或核参数一旦改动，演练必须重新开始 */
+function drillBaseChanged() {
+  if (!drill.base) return false;
+  let cur;
+  try { cur = currentModelInputs(); } catch (e) { return true; }
+  const b = drill.base;
+  const sameList = (a, c) => a.length === c.length && a.every((v, k) => v === c[k]);
+  return !sameList(cur.measured_times, b.measured_times)
+    || !sameList(cur.measured_values, b.measured_values)
+    || cur.length_scale !== b.length_scale
+    || cur.noise_std !== b.noise_std
+    || cur.signal_variance !== b.signal_variance;
+}
+
+function requireActiveDrill() {
+  if (!drill.active) throw new Error("请先点击「开始演练」抽出轨迹");
+  if (drillBaseChanged()) {
+    throw new Error("实测读数、观测噪声或核参数已改动：请重新点击「开始演练」开始一轮新演练"
+      + "（原有轨迹基于旧数据，不能继续追加或重标）");
+  }
+}
+
+/* 把服务端返回的 3 条轨迹收敛为 {times, values}，用于追加或重标 */
+function trajectoryPayload() {
+  return drill.trajectories.map(t => ({ times: t.times, values: t.values }));
+}
+
+async function postDrill(url, payload) {
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  let data = null;
+  try { data = await resp.json(); } catch (e) { /* 非 JSON 响应 */ }
+  if (!resp.ok) {
+    const d = data && data.detail;
+    if (d && typeof d === "object") {
+      let msg = `【${d.code || "ERROR"}】${d.message || "请求被拒绝"}`;
+      if (Array.isArray(d.errors)) msg += "\n" + d.errors.map(e => `· ${e.loc.join(".")}: ${e.msg}`).join("\n");
+      throw new Error(msg);
+    }
+    throw new Error(typeof d === "string" ? d : `请求失败（HTTP ${resp.status}）`);
+  }
+  return data;
+}
+
+function applyDrillResult(data, { keepTrajectoriesIfMissing = false } = {}) {
+  if (Array.isArray(data.trajectories)) drill.trajectories = data.trajectories;
+  else if (!keepTrajectoriesIfMissing) drill.trajectories = [];
+  if (typeof data.n_distinct_times === "number") drill.nDistinct = data.n_distinct_times;
+  if (typeof data.alarm_temperature === "number") drill.alarm = data.alarm_temperature;
+  if (typeof data.seed === "number") drill.seed = data.seed;
+  if (typeof data.step === "number") drill.step = data.step;
+  drill.adjusted = Boolean(data.numerically_adjusted);
+  drill.active = drill.trajectories.length === 3;
+  renderDrill();
+}
+
+async function runDrillAction(button, fn) {
+  if (button) button.disabled = true;
+  try { await fn(); }
+  catch (err) { drillError(err.message); }
+  finally { if (button) button.disabled = false; }
+}
+
+$("drill-demo").addEventListener("click", () => {
+  $("measured-times").value = DEMO.measured_times.join(", ");
+  $("measured-values").value = DEMO.measured_values.join(", ");
+  $("candidate-times").value = DEMO.candidate_times.join(", ");
+  $("length-scale").value = 2;
+  $("noise-std").value = 5;
+  $("signal-variance").value = 100000;
+  $("min-interval").value = 1;
+  $("alarm-temperature").value = 700;
+  $("drill-times").value = "0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 9, 10.5, 11.5, 12.5, 14, 15.5";
+  $("drill-new-times").value = "6.2, 12.8";
+  clearError();
+  clearDrillMessages();
+});
+
+$("drill-start").addEventListener("click", () => runDrillAction($("drill-start"), async () => {
+  clearDrillMessages();
+  const model = currentModelInputs();
+  const alarm = alarmValue();
+  const seed = seedValue();
+  const drillTimes = parseNumList($("drill-times").value, "演练时刻");
+  if (!drillTimes.length) throw new Error("请填写至少一个演练时刻");
+  let data;
+  try {
+    data = await postDrill("/api/drill/start", {
+      ...model, alarm_temperature: alarm, drill_times: drillTimes, seed,
+    });
+  } catch (err) {
+    // 开始失败：旧轨迹可能基于不同数据，清空以免误读（加点失败则保留）
+    drill.active = false;
+    drill.trajectories = [];
+    drill.base = null;
+    renderDrill();
+    throw new Error(`开始演练失败：${err.message}`);
+  }
+  drill.base = model;
+  drill.active = false;
+  applyDrillResult(data);
+  drillNote(`已抽出 3 条轨迹（种子 ${seed}）。可插入新时刻，或修改报警温度后点「只按新报警温度更新标记」。`);
+}));
+
+$("drill-add").addEventListener("click", () => runDrillAction($("drill-add"), async () => {
+  clearDrillMessages();
+  requireActiveDrill();
+  const model = currentModelInputs();
+  const newTimes = newTimesValue();
+  const alarm = alarmValue();
+  try {
+    const data = await postDrill("/api/drill/extend", {
+      ...model, alarm_temperature: alarm,
+      trajectories: trajectoryPayload(),
+      new_times: newTimes, seed: drill.seed, step: drill.step,
+    });
+    applyDrillResult(data);
+    drillNote(`已插入 ${newTimes.length} 个时刻；原有取值保持不变，标记已更新。`
+      + ` 当前累计 ${data.n_distinct_times} / ${data.max_distinct_times} 个不同时刻。`);
+  } catch (err) {
+    // 保留上次的轨迹与标记，只提示失败原因
+    drillError(`加点失败：${err.message}\n（上次的 3 条轨迹与标记保持不变）`);
+  }
+}));
+
+$("drill-recheck").addEventListener("click", () => runDrillAction($("drill-recheck"), async () => {
+  clearDrillMessages();
+  requireActiveDrill();
+  const alarm = alarmValue();
+  try {
+    const data = await postDrill("/api/drill/alarm", {
+      trajectories: trajectoryPayload(),
+      alarm_temperature: alarm,
+    });
+    applyDrillResult(data, { keepTrajectoriesIfMissing: true });
+    drillNote(`已沿用原 3 条轨迹，仅按报警温度 ${fmt(alarm)} 更新首次超温标记。`);
+  } catch (err) {
+    drillError(`更新标记失败：${err.message}\n（上次的 3 条轨迹与标记保持不变）`);
+  }
+}));
+
+/* 调整报警温度后（输入框失焦/回车）自动沿用原轨迹更新标记 */
+$("alarm-temperature").addEventListener("change", () => {
+  if (!drill.active) return;
+  const alarm = Number($("alarm-temperature").value);
+  if (!Number.isFinite(alarm)) { drillError("报警温度必须是有限数值"); return; }
+  if (drill.trajectories.length && drill.alarm === alarm) return;  // 未变化
+  if (drillBaseChanged()) {
+    drillError("实测读数、观测噪声或核参数已改动：请重新点击「开始演练」开始一轮新演练"
+      + "（原有轨迹基于旧数据，不能继续追加或重标）");
+    return;
+  }
+  $("drill-recheck").click();
+});
+
+/* ---------- 演练结果渲染 ---------- */
+
+function renderDrill() {
+  const card = $("drill-result");
+  if (!drill.trajectories.length) { card.hidden = true; return; }
+  card.hidden = false;
+  const alarm = drill.alarm;
+  const summary = $("drill-summary");
+  summary.innerHTML = "";
+  const hits = drill.trajectories.filter(t => t.alarm && t.alarm.exceeded);
+  const firsts = hits.map(t => t.alarm.first_time);
+  const metrics = [
+    ["报警温度", fmt(alarm)],
+    ["轨迹条数", String(drill.trajectories.length)],
+    ["累计不同时刻", `${drill.nDistinct} / ${DRILL_LIMIT}`],
+    ["已超温轨迹", `${hits.length} / ${drill.trajectories.length}`],
+    ["最早超温时刻", firsts.length ? fmt(Math.min(...firsts)) : "均未超温"],
+  ];
+  for (const [k, v, sel] of metrics) {
+    const div = document.createElement("div");
+    div.className = "metric";
+    div.innerHTML = `<div class="k">${k}</div><div class="v${sel ? " sel" : ""}">${v}</div>`;
+    summary.appendChild(div);
+  }
+
+  const series = [];
+  drill.trajectories.forEach((tr, k) => {
+    // 追加的时刻可能排在末尾，画线前按时刻排序
+    const pts = tr.times.map((t, i) => ({ t, v: tr.values[i] })).sort((a, b) => a.t - b.t);
+    const x = pts.map(p => p.t), y = pts.map(p => p.v);
+    series.push({ type: "line", x, y, color: TRAJ_COLORS[k % 3], width: 1.8 });
+    series.push({ type: "points", x, y, color: TRAJ_COLORS[k % 3], r: 2.5 });
+    if (tr.alarm && tr.alarm.exceeded) {
+      series.push({ type: "rings", x: [tr.alarm.first_time], y: [tr.alarm.first_value],
+                     color: "#cf222e", r: 6 });
+    }
+  });
+  series.push({ type: "hline", y: alarm, color: "#cf222e", dash: "6 4" });
+  drawChart($("drill-chart"), series, { xLabel: "时刻", yLabel: "温度" });
+
+  const tbody = $("drill-tbody");
+  tbody.innerHTML = "";
+  drill.trajectories.forEach((tr, k) => {
+    const a = tr.alarm || {};
+    const tr_el = document.createElement("tr");
+    const status = a.exceeded
+      ? `<span class="alarm-yes">${fmt(a.first_time)}</span>`
+      : `<span class="alarm-no">未超温</span>`;
+    const note = a.exceeded
+      ? "已模拟时刻中最早越过报警温度的点"
+      : `所有已模拟时刻均不超过 ${fmt(alarm)}`;
+    tr_el.innerHTML = `<td class="l">轨迹 ${k + 1}</td><td>${tr.times.length}</td>` +
+      `<td>${status}</td><td>${a.exceeded ? fmt(a.first_value) : "—"}</td>` +
+      `<td class="l">${note}</td>`;
+    tbody.appendChild(tr_el);
+  });
+
+  if (drill.adjusted) {
+    $("drill-warn").textContent = "提示：条件协方差在数值上只是半正定，抽样时对极小负特征值做了截断修正。"
+      + "若时刻间隔过密，建议增大观测噪声或拉开时刻间隔后重新开始。";
+    $("drill-warn").hidden = false;
+  } else {
+    $("drill-warn").hidden = true;
+  }
+}
+
 /* ---------- 简易 SVG 图表 ---------- */
 
 function drawChart(svg, series, { xLabel, yLabel }) {
@@ -349,6 +706,7 @@ function drawChart(svg, series, { xLabel, yLabel }) {
   for (const s of series) {
     if (s.type === "band") s.x.forEach((x, k) => { eat(x, s.y0[k]); eat(x, s.y1[k]); });
     else if (s.type === "vlines") s.x.forEach(x => eat(x, NaN));
+    else if (s.type === "hline") eat(NaN, s.y);
     else s.x.forEach((x, k) => eat(x, s.y[k]));
   }
   if (!Number.isFinite(xMin)) { xMin = 0; xMax = 1; yMin = 0; yMax = 1; }
@@ -398,6 +756,19 @@ function drawChart(svg, series, { xLabel, yLabel }) {
         x1: X(x), y1: P.t, x2: X(x), y2: P.t + ih,
         stroke: s.color, "stroke-width": 1.5, "stroke-dasharray": s.dash || "none",
       })));
+    } else if (s.type === "hline") {
+      svg.appendChild(el("line", {
+        x1: P.l, y1: Y(s.y), x2: P.l + iw, y2: Y(s.y),
+        stroke: s.color, "stroke-width": 1.5, "stroke-dasharray": s.dash || "none",
+      }));
+      svg.appendChild(el("text", { x: P.l + iw - 4, y: Y(s.y) - 4, "font-size": 10,
+        "text-anchor": "end", fill: s.color }, `报警 ${fmt(s.y)}`));
+    } else if (s.type === "rings") {
+      s.x.forEach((x, k) => {
+        if (!Number.isFinite(s.y[k])) return;
+        svg.appendChild(el("circle", { cx: X(x), cy: Y(s.y[k]), r: s.r || 5,
+          fill: "none", stroke: s.color, "stroke-width": 2 }));
+      });
     }
   }
 }

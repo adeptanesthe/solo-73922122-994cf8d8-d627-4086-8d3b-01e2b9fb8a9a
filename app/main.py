@@ -7,13 +7,24 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 
+from .drill import (
+    DrillError,
+    extend_trajectories,
+    recheck_alarm,
+    sample_new_trajectories,
+)
 from .gp import GPError, select_pair
-from .schemas import SelectRequest
+from .schemas import (
+    DrillAlarmRequest,
+    DrillExtendRequest,
+    DrillStartRequest,
+    SelectRequest,
+)
 
 app = FastAPI(
     title="高温炉温度采样选点",
-    version="1.0.0",
-    summary="基于高斯过程后验协方差下降，为炉温实验选择两个新增采样点",
+    version="1.1.0",
+    summary="基于高斯过程后验协方差下降选择两个新增采样点，并支持超温报警演练",
 )
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -39,6 +50,18 @@ async def _validation_handler(_request: Request, exc: RequestValidationError) ->
                 "errors": errors,
             }
         },
+    )
+
+
+def _drill_failure(exc: Exception) -> HTTPException:
+    """演练错误 -> 422 结构化响应（前端据此保留上次轨迹与标记）。"""
+    if isinstance(exc, DrillError):
+        return HTTPException(status_code=422, detail={"code": exc.code, "message": str(exc)})
+    if isinstance(exc, GPError):
+        return HTTPException(status_code=422, detail={"code": exc.code, "message": str(exc)})
+    return HTTPException(
+        status_code=422,
+        detail={"code": "DRILL_ERROR", "message": f"演练计算失败：{exc}"},
     )
 
 
@@ -93,6 +116,84 @@ def select(req: SelectRequest) -> dict:
         "n_pairs_feasible": res.n_pairs_feasible,
         "candidates": candidates,
     }
+
+
+# ---------------------------------------------------------------------------
+# 超温报警演练
+# ---------------------------------------------------------------------------
+
+
+def _run_drill(fn, **kwargs) -> dict:
+    try:
+        return fn(**kwargs)
+    except (DrillError, GPError) as exc:
+        raise _drill_failure(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422, detail={"code": "INVALID_INPUT", "message": str(exc)}
+        ) from exc
+
+
+@app.post("/api/drill/start", tags=["drill"])
+def drill_start(req: DrillStartRequest) -> dict:
+    """演练开始：在给定时刻上从后验独立抽出 3 条轨迹，并标出各自的首次超温点。
+
+    失败（422）时不返回任何轨迹，前端保留上次结果。错误码：
+    INVALID_INPUT / NON_FINITE_INPUT / KERNEL_NOT_PSD / DUPLICATE_DRILL_TIME /
+    TOO_MANY_DRILL_TIMES / DRILL_ERROR。
+    """
+    result = _run_drill(
+        sample_new_trajectories,
+        measured_times=req.measured_times,
+        measured_values=req.measured_values,
+        drill_times=req.drill_times,
+        length_scale=req.length_scale,
+        noise_std=req.noise_std,
+        signal_variance=req.signal_variance,
+        alarm_temperature=req.alarm_temperature,
+        seed=req.seed,
+    )
+    result["alarm_temperature"] = req.alarm_temperature
+    result["seed"] = req.seed
+    result["step"] = 0
+    return result
+
+
+@app.post("/api/drill/extend", tags=["drill"])
+def drill_extend(req: DrillExtendRequest) -> dict:
+    """插入新时刻：每条轨迹以自身已有取值为条件联合抽样，原有取值不变。
+
+    失败（422：重复时刻 / 超过 200 个不同时刻 / 数值问题）时前端保留上次轨迹与标记。
+    """
+    result = _run_drill(
+        extend_trajectories,
+        measured_times=req.measured_times,
+        measured_values=req.measured_values,
+        trajectories=[t.model_dump() for t in req.trajectories],
+        new_times=req.new_times,
+        length_scale=req.length_scale,
+        noise_std=req.noise_std,
+        signal_variance=req.signal_variance,
+        alarm_temperature=req.alarm_temperature,
+        seed=req.seed,
+        step=req.step,
+    )
+    result["alarm_temperature"] = req.alarm_temperature
+    result["seed"] = req.seed
+    result["step"] = req.step + 1
+    return result
+
+
+@app.post("/api/drill/alarm", tags=["drill"])
+def drill_alarm(req: DrillAlarmRequest) -> dict:
+    """只调整报警温度：沿用原轨迹，仅重算每条轨迹的首次超温标记。"""
+    result = _run_drill(
+        recheck_alarm,
+        trajectories=[t.model_dump() for t in req.trajectories],
+        alarm_temperature=req.alarm_temperature,
+    )
+    result["alarm_temperature"] = req.alarm_temperature
+    return result
 
 
 @app.get("/", include_in_schema=False)

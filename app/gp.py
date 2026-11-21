@@ -25,6 +25,9 @@
 * 输入含 NaN / Inf            -> NonFiniteInputError
 * 观测核矩阵非正定            -> KernelNotPSDError
 * 不存在合法候选点对          -> NoFeasibleCombinationError
+
+`posterior_mean_cov` 复用同一套参数校验与核正定性检查，供超温报警演练
+（`app/drill.py`）做条件抽样使用。
 """
 from __future__ import annotations
 
@@ -40,6 +43,7 @@ __all__ = [
     "NoFeasibleCombinationError",
     "SelectionResult",
     "squared_exponential_kernel",
+    "posterior_mean_cov",
     "select_pair",
 ]
 
@@ -117,20 +121,11 @@ def squared_exponential_kernel(x, y, length_scale: float, signal_variance: float
     return signal_variance * np.exp(-0.5 * d2 / (length_scale * length_scale))
 
 
-def _posterior_mean_cov(
-    t_obs: np.ndarray,
-    y_obs: np.ndarray,
-    t_cand: np.ndarray,
-    length_scale: float,
-    noise_var: float,
-    signal_variance: float,
-):
-    """候选时刻上的后验均值与后验协方差矩阵。"""
-    k_cc = squared_exponential_kernel(t_cand, t_cand, length_scale, signal_variance)
+def _observations_cholesky(
+    t_obs: np.ndarray, noise_var: float, length_scale: float, signal_variance: float
+) -> np.ndarray:
+    """已测数据的观测核矩阵 Cholesky 因子（含观测噪声），非正定则整批拒绝。"""
     n_obs = t_obs.size
-    if n_obs == 0:
-        return np.zeros(t_cand.size), k_cc
-
     k_oo = squared_exponential_kernel(t_obs, t_obs, length_scale, signal_variance)
     k_oo = k_oo + noise_var * np.eye(n_obs)
     # 零噪声 + 重复已测时刻 => 核矩阵必然奇异（数学上只是半正定），直接判定非正定。
@@ -156,6 +151,24 @@ def _posterior_mean_cov(
             "观测核矩阵（含观测噪声）数值上非正定（Cholesky 主元近零）：可能存在近重复的"
             "已测时刻且观测噪声过小。请修正数据或增大观测噪声后重试。"
         )
+    return chol
+
+
+def _posterior_mean_cov(
+    t_obs: np.ndarray,
+    y_obs: np.ndarray,
+    t_cand: np.ndarray,
+    length_scale: float,
+    noise_var: float,
+    signal_variance: float,
+):
+    """候选时刻上的后验均值与后验协方差矩阵。"""
+    k_cc = squared_exponential_kernel(t_cand, t_cand, length_scale, signal_variance)
+    n_obs = t_obs.size
+    if n_obs == 0:
+        return np.zeros(t_cand.size), k_cc
+
+    chol = _observations_cholesky(t_obs, noise_var, length_scale, signal_variance)
 
     k_co = squared_exponential_kernel(t_cand, t_obs, length_scale, signal_variance)
     # 用 Cholesky 因子求解，避免显式求逆
@@ -165,6 +178,40 @@ def _posterior_mean_cov(
     z = np.linalg.solve(chol, y_obs)
     mean = k_co @ np.linalg.solve(chol.T, z)
     return mean, cov
+
+
+def posterior_mean_cov(
+    measured_times,
+    measured_values,
+    target_times,
+    *,
+    length_scale: float,
+    noise_std: float,
+    signal_variance: float = 1.0,
+):
+    """公开接口：已测数据条件下，目标时刻上的后验均值与后验协方差。
+
+    供演练抽样使用。参数合法性、非有限值与核正定性检查与选点逻辑一致，
+    异常时抛出 GPError 子类（整批拒绝）。
+    """
+    length_scale = _finite_scalar(length_scale, "length_scale")
+    noise_std = _finite_scalar(noise_std, "noise_std")
+    signal_variance = _finite_scalar(signal_variance, "signal_variance")
+    if length_scale <= 0:
+        raise ValueError("length_scale 必须 > 0")
+    if noise_std < 0:
+        raise ValueError("noise_std 必须 >= 0")
+    if signal_variance <= 0:
+        raise ValueError("signal_variance 必须 > 0")
+
+    t_obs = _as_finite_1d(measured_times, "已测时刻")
+    y_obs = _as_finite_1d(measured_values, "已测温度")
+    if t_obs.size != y_obs.size:
+        raise ValueError("已测时刻与已测温度数量不一致")
+    t_target = _as_finite_1d(target_times, "目标时刻")
+    return _posterior_mean_cov(
+        t_obs, y_obs, t_target, length_scale, noise_std * noise_std, signal_variance
+    )
 
 
 def select_pair(
